@@ -1,4 +1,5 @@
 import { GoogleImageEnv, GoogleImageSearch } from '../google/image_search'
+import { isRenderableImageType } from '../lib/image_types'
 import { consoleLogger as logger } from '../lib/logger'
 import { verify } from './signature'
 
@@ -25,7 +26,8 @@ export type JpiImageDeps<E extends GoogleImageEnv> = {
   bucket?: R2BucketLike
   fetcher?: typeof fetch
   /**
-   * Returns an index into `urls` for the given seed. Default hashes the seed
+   * Returns an index into `urls` (only the candidates that actually returned
+   * an image) for the given seed. Default hashes the seed
    * (q+t) with SHA-256, so a given post is rendered the same across all edge
    * colos / users instead of each region rolling its own Math.random(). Once
    * R2 is in front of CSE the index choice only matters for the very first
@@ -51,10 +53,80 @@ const UPSTREAM_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 const IMAGE_CACHE_CONTROL = 'public, s-maxage=300, max-age=0'
 const PLACEHOLDER_CACHE_CONTROL = 'public, s-maxage=60, max-age=0'
-// Slack rejects the entire block if image_url returns a content-type it can't
-// render (e.g. SVG, text/html error pages). Only forward known-safe raster
-// types; everything else falls back to placeholder.
-const ALLOWED_IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)(;.*)?$/i
+type FetchedImage = { buf: ArrayBuffer; contentType: string }
+type Candidate = { url: string; res: Response; contentType: string }
+
+// Fetches one candidate and keeps it only if the response is OK and claims a
+// Slack-renderable image type. The body is left unread so that candidates we
+// end up not serving can be cancelled without downloading them.
+async function probeCandidate(fetcher: typeof fetch, q: string, url: string): Promise<Candidate | null> {
+  try {
+    const res = await fetcher(url, {
+      headers: { 'User-Agent': UPSTREAM_USER_AGENT },
+    })
+    if (!res.ok) {
+      logger.warn('handleJpiImage: upstream fetch not ok', { q, url, status: res.status })
+      await discardBody(res)
+      return null
+    }
+    const contentType = res.headers.get('content-type') ?? ''
+    if (!isRenderableImageType(contentType)) {
+      logger.warn('handleJpiImage: upstream content-type not allowed', { q, url, contentType })
+      await discardBody(res)
+      return null
+    }
+    return { url, res, contentType }
+  } catch (e) {
+    logger.warn('handleJpiImage: upstream fetch threw', { q, url, error: String(e) })
+    return null
+  }
+}
+
+async function discardBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel()
+  } catch {
+    // Already consumed or errored; nothing left to release.
+  }
+}
+
+// CSE results often include URLs that don't serve image bytes (rate limits,
+// HTML landing pages). Probe every candidate in parallel and choose only among
+// the ones that actually returned an image, so one bad link never turns the
+// post into a placeholder while a good one exists.
+async function selectImage(
+  fetcher: typeof fetch,
+  q: string,
+  urls: string[],
+  seed: string,
+  pickIndex: (urls: string[], seed: string) => Promise<number> | number,
+): Promise<FetchedImage | null> {
+  const probed = await Promise.all(urls.map((url) => probeCandidate(fetcher, q, url)))
+  const valid = probed.filter((c): c is Candidate => c !== null)
+  if (valid.length === 0) return null
+
+  const rawIdx = await pickIndex(
+    valid.map((c) => c.url),
+    seed,
+  )
+  const start = Math.max(0, Math.min(valid.length - 1, Math.floor(Number.isFinite(rawIdx) ? rawIdx : 0)))
+  // Start from the seeded pick so a given post stays stable; if reading its
+  // body fails, walk forward (wrapping) through the other valid candidates.
+  let served: FetchedImage | null = null
+  for (let i = 0; i < valid.length; i++) {
+    const candidate = valid[(start + i) % valid.length]
+    if (served) {
+      await discardBody(candidate.res)
+      continue
+    }
+    try {
+      served = { buf: await candidate.res.arrayBuffer(), contentType: candidate.contentType }
+    } catch (e) {
+      logger.warn('handleJpiImage: upstream body read failed', { q, url: candidate.url, error: String(e) })
+    }
+  }
+  return served
+}
 
 function placeholderResponse(): Response {
   return new Response(null, {
@@ -131,7 +203,7 @@ export async function handleJpiImage<E extends GoogleImageEnv>(
         const contentType = obj.httpMetadata?.contentType ?? ''
         // Same rule as upstream — guard against historical entries with missing
         // or non-image metadata that would make Slack reject the block.
-        if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
+        if (!isRenderableImageType(contentType)) {
           logger.warn('handleJpiImage: R2 object content-type not allowed', { q, contentType })
         } else {
           const buf = await obj.arrayBuffer()
@@ -155,35 +227,17 @@ export async function handleJpiImage<E extends GoogleImageEnv>(
     return respond(placeholderResponse())
   }
 
-  const rawIdx = await pickIndex(urls, `${q}:${t}`)
-  const safeIdx = Math.max(0, Math.min(urls.length - 1, Math.floor(Number.isFinite(rawIdx) ? rawIdx : 0)))
-  const picked = urls[safeIdx]
-  try {
-    const imgRes = await fetcher(picked, {
-      headers: { 'User-Agent': UPSTREAM_USER_AGENT },
-    })
-    if (!imgRes.ok) {
-      logger.warn('handleJpiImage: upstream fetch not ok', { q, url: picked, status: imgRes.status })
-      return respond(placeholderResponse())
-    }
-    const contentType = imgRes.headers.get('content-type') ?? ''
-    if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
-      logger.warn('handleJpiImage: upstream content-type not allowed', { q, url: picked, contentType })
-      return respond(placeholderResponse())
-    }
-    const buf = await imgRes.arrayBuffer()
-
-    if (bucket && ctx) {
-      ctx.waitUntil(
-        bucket.put(objectKey, buf, { httpMetadata: { contentType } }).catch((e: unknown) => {
-          logger.warn('handleJpiImage: R2 put failed', { q, error: String(e) })
-        }),
-      )
-    }
-
-    return respond(imageResponse(buf, contentType))
-  } catch (e) {
-    logger.warn('handleJpiImage: upstream fetch threw', { q, url: picked, error: String(e) })
+  const image = await selectImage(fetcher, q, urls, `${q}:${t}`, pickIndex)
+  if (!image) {
     return respond(placeholderResponse())
   }
+
+  if (bucket && ctx) {
+    ctx.waitUntil(
+      bucket.put(objectKey, image.buf, { httpMetadata: { contentType: image.contentType } }).catch((e: unknown) => {
+        logger.warn('handleJpiImage: R2 put failed', { q, error: String(e) })
+      }),
+    )
+  }
+  return respond(imageResponse(image.buf, image.contentType))
 }

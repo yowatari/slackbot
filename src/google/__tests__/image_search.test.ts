@@ -53,4 +53,37 @@ describe('GoogleImageSearch.image_urls', () => {
       'https://example.com/img.jpg',
     ])
   })
+
+  it('filters out Instagram lookaside crawler URLs (HTML / 429, never an image)', async () => {
+    const fetcher = makeFetcher({
+      items: [
+        { link: 'https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=1' },
+        { link: 'https://example.com/img.jpg' },
+      ],
+    })
+    const search = new GoogleImageSearch(env, fetcher)
+    expect(await search.image_urls('test')).toEqual(['https://example.com/img.jpg'])
+  })
+
+  it('drops candidates whose CSE mime is not a Slack-renderable raster image', async () => {
+    const fetcher = makeFetcher({
+      items: [
+        { link: 'https://example.com/a.jpg', mime: 'image/jpeg' },
+        { link: 'https://example.com/b.svg', mime: 'image/svg+xml' },
+        { link: 'https://example.com/c', mime: 'text/html' },
+        { link: 'https://example.com/d.webp', mime: 'image/webp' },
+        { link: 'https://example.com/e.bmp', mime: 'image/bmp' },
+      ],
+    })
+    const search = new GoogleImageSearch(env, fetcher)
+    expect(await search.image_urls('test')).toEqual(['https://example.com/a.jpg', 'https://example.com/d.webp'])
+  })
+
+  it('keeps candidates without mime metadata (cannot judge before fetching)', async () => {
+    const fetcher = makeFetcher({
+      items: [{ link: 'https://example.com/a.jpg' }, { link: 'https://example.com/b.png', mime: 'image/png' }],
+    })
+    const search = new GoogleImageSearch(env, fetcher)
+    expect(await search.image_urls('test')).toEqual(['https://example.com/a.jpg', 'https://example.com/b.png'])
+  })
 })
