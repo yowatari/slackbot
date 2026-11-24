@@ -1,4 +1,5 @@
 import { GoogleImageEnv, GoogleImageSearch } from '../google/image_search'
+import { isRenderableImageType } from '../lib/image_types'
 import { consoleLogger as logger } from '../lib/logger'
 import { verify } from './signature'
 
@@ -51,10 +52,6 @@ const UPSTREAM_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 const IMAGE_CACHE_CONTROL = 'public, s-maxage=300, max-age=0'
 const PLACEHOLDER_CACHE_CONTROL = 'public, s-maxage=60, max-age=0'
-// Slack rejects the entire block if image_url returns a content-type it can't
-// render (e.g. SVG, text/html error pages). Only forward known-safe raster
-// types; everything else falls back to placeholder.
-const ALLOWED_IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)(;.*)?$/i
 // CSE results often include URLs that don't serve image bytes (rate limits,
 // HTML landing pages). Try a few candidates before giving up so one bad link
 // doesn't turn the whole post into a placeholder.
@@ -72,7 +69,7 @@ async function fetchImage(fetcher: typeof fetch, q: string, url: string): Promis
       return null
     }
     const contentType = imgRes.headers.get('content-type') ?? ''
-    if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
+    if (!isRenderableImageType(contentType)) {
       logger.warn('handleJpiImage: upstream content-type not allowed', { q, url, contentType })
       return null
     }
@@ -158,7 +155,7 @@ export async function handleJpiImage<E extends GoogleImageEnv>(
         const contentType = obj.httpMetadata?.contentType ?? ''
         // Same rule as upstream — guard against historical entries with missing
         // or non-image metadata that would make Slack reject the block.
-        if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
+        if (!isRenderableImageType(contentType)) {
           logger.warn('handleJpiImage: R2 object content-type not allowed', { q, contentType })
         } else {
           const buf = await obj.arrayBuffer()

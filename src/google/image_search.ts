@@ -1,8 +1,10 @@
+import { isRenderableImageType } from '../lib/image_types'
 import { consoleLogger as logger } from '../lib/logger'
 
 type result = {
   items?: Array<{
     link?: string | null
+    mime?: string | null
   }>
 }
 
@@ -54,7 +56,12 @@ export class GoogleImageSearch<E extends GoogleImageEnv> {
     }
     const result = (await res.json()) as result
     const total = result.items?.length ?? 0
-    const filtered = (result.items ?? []).map((i) => i.link).filter((l): l is string => !!l && !isBlockedUrl(l))
+    const filtered = (result.items ?? [])
+      // CSE's mime is a hint only: when absent, keep the candidate and let the
+      // image endpoint verify it by actually fetching.
+      .filter((i) => !i.mime || isRenderableImageType(i.mime))
+      .map((i) => i.link)
+      .filter((l): l is string => !!l && !isBlockedUrl(l))
     if (filtered.length === 0) {
       logger.warn('GoogleImageSearch: no urls after filter', { q, total, filtered: filtered.length })
     }
