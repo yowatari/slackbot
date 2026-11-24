@@ -222,6 +222,101 @@ describe('handleJpiImage', () => {
     expect(res.headers.get('location')).toMatch(/^https:\/\/placehold\.co\//)
   })
 
+  describe('fallback to the next candidate when the picked one fails', () => {
+    const png = () => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } })
+    const urls = ['https://a.example/1.png', 'https://b.example/2.png', 'https://c.example/3.png']
+
+    it('tries the next candidate when upstream returns not ok', async () => {
+      const fetcher = jest.fn(async (u: string) =>
+        u.startsWith('https://b.') ? new Response('', { status: 429 }) : png(),
+      )
+      const res = await handleJpiImage(new Request(await signedUrl('neko')), {
+        search: makeSearch(async () => urls),
+        signingSecret: SECRET,
+        fetcher: fetcher as unknown as typeof fetch,
+        pickIndex: () => 1,
+      })
+      expect(res.status).toBe(200)
+      expect(res.headers.get('content-type')).toBe('image/png')
+      expect(fetcher.mock.calls.map((c) => c[0])).toEqual([urls[1], urls[2]])
+    })
+
+    it('wraps around to the first candidate after the last one', async () => {
+      const fetcher = jest.fn(async (u: string) =>
+        u.startsWith('https://c.')
+          ? new Response('<html/>', { status: 200, headers: { 'content-type': 'text/html' } })
+          : png(),
+      )
+      const res = await handleJpiImage(new Request(await signedUrl('neko')), {
+        search: makeSearch(async () => urls),
+        signingSecret: SECRET,
+        fetcher: fetcher as unknown as typeof fetch,
+        pickIndex: () => 2,
+      })
+      expect(res.status).toBe(200)
+      expect(fetcher.mock.calls.map((c) => c[0])).toEqual([urls[2], urls[0]])
+    })
+
+    it('tries the next candidate when the fetch throws', async () => {
+      const fetcher = jest.fn(async (u: string) => {
+        if (u.startsWith('https://a.')) throw new Error('network down')
+        return png()
+      })
+      const res = await handleJpiImage(new Request(await signedUrl('neko')), {
+        search: makeSearch(async () => urls),
+        signingSecret: SECRET,
+        fetcher: fetcher as unknown as typeof fetch,
+        pickIndex: () => 0,
+      })
+      expect(res.status).toBe(200)
+      expect(fetcher).toHaveBeenCalledTimes(2)
+    })
+
+    it('stores the fallback image in R2 under the original (q, t) key', async () => {
+      const bucket = makeBucket(null)
+      const waits: Promise<unknown>[] = []
+      const ctx = { waitUntil: (p: Promise<unknown>) => void waits.push(p) }
+      const cache = { match: jest.fn(async () => undefined), put: jest.fn(async () => undefined) }
+      const originalCaches = (globalThis as any).caches
+      ;(globalThis as any).caches = { default: cache }
+      const fetcher = jest.fn(async (u: string) =>
+        u.startsWith('https://a.') ? new Response('', { status: 500 }) : png(),
+      )
+      const res = await handleJpiImage(
+        new Request(await signedUrl('neko')),
+        {
+          search: makeSearch(async () => urls),
+          signingSecret: SECRET,
+          fetcher: fetcher as unknown as typeof fetch,
+          pickIndex: () => 0,
+          bucket,
+        },
+        ctx,
+      ).finally(() => {
+        ;(globalThis as any).caches = originalCaches
+      })
+      await Promise.all(waits)
+      expect(res.status).toBe(200)
+      expect(bucket.put).toHaveBeenCalledWith(`neko:${FIXED_NOW}`, expect.any(ArrayBuffer), {
+        httpMetadata: { contentType: 'image/png' },
+      })
+    })
+
+    it('gives up after 3 attempts and returns the placeholder', async () => {
+      const many = ['1', '2', '3', '4', '5'].map((n) => `https://x.example/${n}.png`)
+      const fetcher = jest.fn(async () => new Response('', { status: 500 }))
+      const res = await handleJpiImage(new Request(await signedUrl('neko')), {
+        search: makeSearch(async () => many),
+        signingSecret: SECRET,
+        fetcher: fetcher as unknown as typeof fetch,
+        pickIndex: () => 0,
+      })
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toMatch(/^https:\/\/placehold\.co\//)
+      expect(fetcher).toHaveBeenCalledTimes(3)
+    })
+  })
+
   it('returns R2-stored bytes without hitting CSE when the object exists', async () => {
     const bytes = new TextEncoder().encode('persisted').buffer as ArrayBuffer
     const bucket = makeBucket({ bytes, contentType: 'image/jpeg' })

@@ -55,6 +55,33 @@ const PLACEHOLDER_CACHE_CONTROL = 'public, s-maxage=60, max-age=0'
 // render (e.g. SVG, text/html error pages). Only forward known-safe raster
 // types; everything else falls back to placeholder.
 const ALLOWED_IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)(;.*)?$/i
+// CSE results often include URLs that don't serve image bytes (rate limits,
+// HTML landing pages). Try a few candidates before giving up so one bad link
+// doesn't turn the whole post into a placeholder.
+const MAX_FETCH_ATTEMPTS = 3
+
+type FetchedImage = { buf: ArrayBuffer; contentType: string }
+
+async function fetchImage(fetcher: typeof fetch, q: string, url: string): Promise<FetchedImage | null> {
+  try {
+    const imgRes = await fetcher(url, {
+      headers: { 'User-Agent': UPSTREAM_USER_AGENT },
+    })
+    if (!imgRes.ok) {
+      logger.warn('handleJpiImage: upstream fetch not ok', { q, url, status: imgRes.status })
+      return null
+    }
+    const contentType = imgRes.headers.get('content-type') ?? ''
+    if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
+      logger.warn('handleJpiImage: upstream content-type not allowed', { q, url, contentType })
+      return null
+    }
+    return { buf: await imgRes.arrayBuffer(), contentType }
+  } catch (e) {
+    logger.warn('handleJpiImage: upstream fetch threw', { q, url, error: String(e) })
+    return null
+  }
+}
 
 function placeholderResponse(): Response {
   return new Response(null, {
@@ -157,33 +184,21 @@ export async function handleJpiImage<E extends GoogleImageEnv>(
 
   const rawIdx = await pickIndex(urls, `${q}:${t}`)
   const safeIdx = Math.max(0, Math.min(urls.length - 1, Math.floor(Number.isFinite(rawIdx) ? rawIdx : 0)))
-  const picked = urls[safeIdx]
-  try {
-    const imgRes = await fetcher(picked, {
-      headers: { 'User-Agent': UPSTREAM_USER_AGENT },
-    })
-    if (!imgRes.ok) {
-      logger.warn('handleJpiImage: upstream fetch not ok', { q, url: picked, status: imgRes.status })
-      return respond(placeholderResponse())
-    }
-    const contentType = imgRes.headers.get('content-type') ?? ''
-    if (!ALLOWED_IMAGE_TYPES.test(contentType)) {
-      logger.warn('handleJpiImage: upstream content-type not allowed', { q, url: picked, contentType })
-      return respond(placeholderResponse())
-    }
-    const buf = await imgRes.arrayBuffer()
+  // Start from the seeded pick so a given post stays stable, then walk
+  // forward (wrapping) through the remaining candidates on failure.
+  const attempts = Math.min(MAX_FETCH_ATTEMPTS, urls.length)
+  for (let i = 0; i < attempts; i++) {
+    const image = await fetchImage(fetcher, q, urls[(safeIdx + i) % urls.length])
+    if (!image) continue
 
     if (bucket && ctx) {
       ctx.waitUntil(
-        bucket.put(objectKey, buf, { httpMetadata: { contentType } }).catch((e: unknown) => {
+        bucket.put(objectKey, image.buf, { httpMetadata: { contentType: image.contentType } }).catch((e: unknown) => {
           logger.warn('handleJpiImage: R2 put failed', { q, error: String(e) })
         }),
       )
     }
-
-    return respond(imageResponse(buf, contentType))
-  } catch (e) {
-    logger.warn('handleJpiImage: upstream fetch threw', { q, url: picked, error: String(e) })
-    return respond(placeholderResponse())
+    return respond(imageResponse(image.buf, image.contentType))
   }
+  return respond(placeholderResponse())
 }
