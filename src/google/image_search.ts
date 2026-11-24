@@ -16,7 +16,9 @@ export type GoogleImageEnv = {
 // revisions; the original incidents weren't documented. Before removing an
 // entry, verify that `!jpi` still posts successfully when CSE returns URLs
 // from that host — Slack rejects the entire block on image fetch failure.
-const BLOCKED_HOST_PATTERN = /(^|\.)(?:ameblo\.jp|ameba\.jp|fc2\.com)$/
+// lookaside.instagram.com: CSE returns its crawler widget URL as an image
+// link, but it serves text/html or 429 instead of image bytes (2026-11).
+const BLOCKED_HOST_PATTERN = /(^|\.)(?:ameblo\.jp|ameba\.jp|fc2\.com)$|^lookaside\.instagram\.com$/
 
 function isBlockedUrl(urlStr: string): boolean {
   try {

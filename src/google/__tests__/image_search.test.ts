@@ -53,4 +53,15 @@ describe('GoogleImageSearch.image_urls', () => {
       'https://example.com/img.jpg',
     ])
   })
+
+  it('filters out Instagram lookaside crawler URLs (HTML / 429, never an image)', async () => {
+    const fetcher = makeFetcher({
+      items: [
+        { link: 'https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=1' },
+        { link: 'https://example.com/img.jpg' },
+      ],
+    })
+    const search = new GoogleImageSearch(env, fetcher)
+    expect(await search.image_urls('test')).toEqual(['https://example.com/img.jpg'])
+  })
 })
