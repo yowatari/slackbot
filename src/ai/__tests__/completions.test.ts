@@ -1,6 +1,6 @@
 import { LlamaChat } from '../completions'
 
-const MODEL_ID = '@cf/qwen/qwen3-30b-a3b-fp8'
+const MODEL_ID = '@cf/qwen/qwen3.8-27b'
 
 function fakeAi(impl: (...args: any[]) => any) {
   return { run: jest.fn(impl) } as any
@@ -48,13 +48,83 @@ describe('LlamaChat', () => {
     await expect(client.completions('Hi')).rejects.toThrow('binding down')
   })
 
-  it('system prompt disables Qwen3 thinking mode with /no_think', async () => {
+  it('disables thinking mode via chat_template_kwargs on every call', async () => {
+    const ai = fakeAi(async () => ({ response: 'ok' }))
+    const client = new LlamaChat(ai)
+    await client.completions('hi')
+    await client.chatWithTools([{ role: 'user', content: 'hi' }], [])
+    for (const [, body] of ai.run.mock.calls) {
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
+    }
+  })
+
+  it('system prompt does not carry the /no_think soft switch', async () => {
     const ai = fakeAi(async () => ({ response: 'ok' }))
     const client = new LlamaChat(ai)
     await client.completions('hi')
     const [, body] = ai.run.mock.calls[0]
     const system = body.messages[0].content as string
-    expect(system).toMatch(/\/no_think/)
+    expect(system).not.toMatch(/\/no_think/)
+  })
+
+  describe('OpenAI chat.completion response shape', () => {
+    const completion = (message: Record<string, unknown>) => ({
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', ...message }, finish_reason: 'stop' }],
+    })
+
+    it('returns the trimmed message content', async () => {
+      const ai = fakeAi(async () => completion({ content: '  こんにちは  ', reasoning: 'thinking...' }))
+      const client = new LlamaChat(ai)
+      expect(await client.completions('hi')).toBe('こんにちは')
+    })
+
+    it('throws when message content is null and no tool was called', async () => {
+      const ai = fakeAi(async () => completion({ content: null, reasoning: 'only thoughts' }))
+      const client = new LlamaChat(ai)
+      await expect(client.completions('hi')).rejects.toThrow(/Unexpected Workers AI response/)
+    })
+
+    it('executes tool_calls nested in choices[0].message', async () => {
+      const spy = jest.fn(async () => 'picked')
+      const ai = fakeAi(async () =>
+        completion({
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'pick_one', arguments: '{"items": "\\u30ab\\u30ec\\u30fc,\\u30e9\\u30fc\\u30e1\\u30f3"}' },
+            },
+          ],
+        }),
+      )
+      const client = new LlamaChat(ai)
+      const out = await client.chatWithTools(
+        [{ role: 'user', content: 'カレーかラーメンか選んで' }],
+        [
+          {
+            name: 'pick_one',
+            description: 'pick 1',
+            parameters: {
+              type: 'object' as const,
+              properties: { items: { type: 'string' as const, description: 'csv' } },
+              required: ['items'],
+            },
+            function: spy,
+          },
+        ],
+      )
+      expect(spy).toHaveBeenCalledWith({ items: 'カレー,ラーメン' })
+      expect(out).toBe('picked')
+    })
+
+    it('returns message content from chatWithTools when no tool was called', async () => {
+      const ai = fakeAi(async () => completion({ content: 'どうも', tool_calls: [] }))
+      const client = new LlamaChat(ai)
+      const out = await client.chatWithTools([{ role: 'user', content: 'hi' }], [])
+      expect(out).toBe('どうも')
+    })
   })
 
   it('system prompt mentions pick_one and warns against shuffle-style requests', async () => {

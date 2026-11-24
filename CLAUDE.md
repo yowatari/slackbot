@@ -8,7 +8,7 @@ Cloudflare Workers 上で動く Slack Bot (`jpi`)。`slack-cloudflare-workers` �
 
 主なコマンド:
 - `!jpi {keyword}` — Google Custom Search で画像をランダム返信 (元 msg への thread reply + 初回 broadcast)
-- `!chat {prompt}` / `@jpi {prompt}` — Cloudflare Workers AI (`@cf/qwen/qwen3-30b-a3b-fp8`) でチャット応答。tool 呼び出し対応 (画像検索 / 抽選 / メッセージ削除)
+- `!chat {prompt}` / `@jpi {prompt}` — Cloudflare Workers AI (`@cf/qwen/qwen3.8-27b`) でチャット応答。tool 呼び出し対応 (画像検索 / 抽選 / メッセージ削除)
 - bot が既に発言したスレッド内では `!chat` prefix なしの平文発言にも応答
 
 自然言語の指示 (例: `@jpi 猫の画像探して` / `@jpi カレーかラーメンか選んで` / `@jpi この URL のメッセージ消して`) は AI が tool を選んで実行する。
@@ -75,7 +75,7 @@ tool 一覧:
 ### External Service Wrappers
 
 - `src/google/image_search.ts` — `GoogleImageSearch` クラス。`ameblo.jp` / `ameba.jp` / `fc2.com` を hostname ベースで除外する block list を内蔵 (`pbs.twimg.com` は許可)。
-- `src/ai/completions.ts` — `LlamaChat` クラス。Cloudflare Workers AI の `@cf/qwen/qwen3-30b-a3b-fp8` を叩く。`env.AI` (binding) を受け取り、`completions(prompt)` / `chat(messages)` で text 応答、`chatWithTools(messages, tools)` で tool calling 対応の自前ループ。
+- `src/ai/completions.ts` — `LlamaChat` クラス。Cloudflare Workers AI の `@cf/qwen/qwen3.8-27b` を叩く。`env.AI` (binding) を受け取り、`completions(prompt)` / `chat(messages)` で text 応答、`chatWithTools(messages, tools)` で tool calling 対応の自前ループ。
 
 Google は `xxxEnv` 型を export し `index.ts` の `Env` 交差型に組み込む。Workers AI は wrangler.toml の `[ai] binding = "AI"` 経由で `env.AI` が直接生える。
 
